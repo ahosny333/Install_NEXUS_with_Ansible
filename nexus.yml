@@ -1,0 +1,152 @@
+---
+- name: Install and Configure Nexus Repository Manager
+  hosts: local
+  become: yes
+  vars:
+    nexus_version: "3.58.1-02"  # Specify the Nexus version
+    nexus_download_url: "https://download.sonatype.com/nexus/3/nexus-{{ nexus_version }}-unix.tar.gz"
+    nexus_install_dir: "/opt/nexus"
+    nexus_data_dir: "/opt/sonatype-work"
+    nexus_user: "nexus"
+    nexus_group: "nexus"
+
+  tasks:
+    - name: Install Java (OpenJDK 8)
+      apt:
+        name: openjdk-8-jdk
+        state: present
+
+    - name: Create Nexus user and group
+      ansible.builtin.user:
+        name: "{{ nexus_user }}"
+        group: "{{ nexus_group }}"
+        system: yes
+        create_home: yes
+        home: "{{ nexus_install_dir }}"
+        shell: /bin/bash
+
+    - name: Create Nexus installation and data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ nexus_user }}"
+        group: "{{ nexus_group }}"
+        mode: '0755'
+      loop:
+        - "{{ nexus_install_dir }}"
+        - "{{ nexus_data_dir }}"
+
+    - name: Download Nexus
+      ansible.builtin.get_url:
+        url: "{{ nexus_download_url }}"
+        dest: "/tmp/nexus.tar.gz"
+
+    - name: Extract Nexus archive
+      ansible.builtin.unarchive:
+        src: "/tmp/nexus.tar.gz"
+        dest: "{{ nexus_install_dir }}"
+        remote_src: yes
+        owner: "{{ nexus_user }}"
+        group: "{{ nexus_group }}"
+        mode: '0755'
+
+    - name: Rename Nexus directory to remove version number
+      ansible.builtin.shell:
+        cmd: "mv {{ nexus_install_dir }}/nexus-{{ nexus_version }} {{ nexus_install_dir }}/nexus"
+      args:
+        creates: "{{ nexus_install_dir }}/nexus"
+
+    - name: Rename Sonatype work directory to remove version number
+      ansible.builtin.shell:
+        cmd: "mv {{ nexus_install_dir }}/sonatype-work/nexus3 {{ nexus_data_dir }}/nexus3"
+      args:
+        creates: "{{ nexus_data_dir }}/nexus3"
+
+    # - name: Configure Nexus runtime options
+    #   ansible.builtin.lineinfile:
+    #     path: "{{ nexus_install_dir }}/nexus/bin/nexus.vmoptions"
+    #     line: "{{ item }}"
+    #     state: present
+    #   loop:
+    #     - "-Xms2703m"
+    #     - "-Xmx2703m"
+    #     - "-XX:MaxDirectMemorySize=2703m"
+    #     - "-Djava.util.prefs.userRoot={{ nexus_data_dir }}/nexus3/tmp"
+
+    - name: Update Nexus configuration to use the correct data directory
+      ansible.builtin.lineinfile:
+        path: "{{ nexus_install_dir }}/nexus/etc/nexus-default.properties"
+        regexp: "^#?nexus-data="
+        line: "nexus-data={{ nexus_data_dir }}/nexus3"
+        state: present
+
+    - name: Update Nexus configuration to use the correct java 8
+      ansible.builtin.lineinfile:
+        path: "{{ nexus_install_dir }}/nexus/bin/nexus.rc"
+        line: "INSTALL4J_JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64"
+        create: yes
+
+    - name: Configure Nexus to run as the nexus user
+      ansible.builtin.copy:
+        dest: "{{ nexus_install_dir }}/nexus/bin/nexus.rc"
+        content: |
+          run_as_user="{{ nexus_user }}"
+
+    - name: Set permissions for Nexus directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        owner: "{{ nexus_user }}"
+        group: "{{ nexus_group }}"
+        recurse: yes
+        mode: '0755'
+      loop:
+        - "{{ nexus_install_dir }}"
+        - "{{ nexus_data_dir }}"
+
+    - name: Create Nexus systemd service file
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nexus.service
+        content: |
+          [Unit]
+          Description=Nexus Repository Manager
+          After=network.target
+
+          [Service]
+          Type=forking
+          User={{ nexus_user }}
+          Group={{ nexus_group }}
+          ExecStart={{ nexus_install_dir }}/nexus/bin/nexus start
+          ExecStop={{ nexus_install_dir }}/nexus/bin/nexus stop
+          Restart=on-abort
+          LimitNOFILE=65536
+          Environment="JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64"
+          WorkingDirectory={{ nexus_install_dir }}/nexus
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd to recognize the new service
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Enable Nexus service to start on boot
+      ansible.builtin.systemd:
+        name: nexus
+        enabled: yes
+
+    - name: Start Nexus service
+      ansible.builtin.systemd:
+        name: nexus
+        state: started
+
+    - name: Wait for Nexus to start (30 seconds)
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - name: Display Nexus access information
+      ansible.builtin.debug:
+        msg: |
+          Nexus has been successfully installed and started.
+          Access Nexus at: http://{{ ansible_facts['default_ipv4']['address'] }}:8081
+          Default username: admin
+          Default password: Check the file /opt/nexus/sonatype-work/nexus3/admin.password
